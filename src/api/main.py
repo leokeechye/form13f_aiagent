@@ -409,6 +409,213 @@ async def clear_cache():
     return {"status": "success", "message": "Cache cleared"}
 
 
+# Temporary data ingestion endpoint - remove after initial setup
+@app.post("/api/v1/ingest", tags=["Admin"])
+async def run_ingestion():
+    """
+    Load 13F TSV data into database using streaming batch inserts.
+    Memory-efficient: streams INFOTABLE.tsv in batches instead of loading all at once.
+    Remove this endpoint after initial setup.
+    """
+    import csv
+    from pathlib import Path
+    from datetime import datetime
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+    from ..db.session import SessionLocal
+    from ..db.models import Manager, Issuer, Filing, Holding
+
+    data_folder = Path("/app/data/raw")
+    if not data_folder.exists():
+        return {"error": f"Data folder not found: {data_folder}"}
+
+    stats = {"managers": 0, "issuers": 0, "filings": 0, "holdings": 0}
+
+    try:
+        session = SessionLocal()
+
+        # --- Phase 1: Parse small files (SUBMISSION, COVERPAGE, SUMMARYPAGE) ---
+        logger.info("Phase 1: Loading submissions, coverpages, summaries...")
+
+        def read_tsv(filename):
+            rows = {}
+            with open(data_folder / filename, "r", encoding="utf-8") as f:
+                for row in csv.DictReader(f, delimiter="\t"):
+                    rows[row["ACCESSION_NUMBER"]] = row
+            return rows
+
+        submissions = read_tsv("SUBMISSION.tsv")
+        coverpages = read_tsv("COVERPAGE.tsv")
+        summaries = read_tsv("SUMMARYPAGE.tsv")
+
+        def parse_date(date_str):
+            return datetime.strptime(date_str, "%d-%b-%Y").date()
+
+        # Build managers and filings from small files
+        managers = {}
+        filing_dicts = []
+
+        for acc_num, sub in submissions.items():
+            if sub["SUBMISSIONTYPE"] != "13F-HR":
+                continue
+            cover = coverpages.get(acc_num)
+            summary = summaries.get(acc_num)
+            if not cover or not summary:
+                continue
+            try:
+                cik = sub["CIK"]
+                managers[cik] = cover["FILINGMANAGER_NAME"]
+                filing_dicts.append({
+                    "accession_number": acc_num,
+                    "cik": cik,
+                    "filing_date": parse_date(sub["FILING_DATE"]),
+                    "period_of_report": parse_date(sub["PERIODOFREPORT"]),
+                    "submission_type": sub["SUBMISSIONTYPE"],
+                    "report_type": cover["REPORTTYPE"],
+                    "total_value": int(summary["TABLEVALUETOTAL"] or 0),
+                    "number_of_holdings": int(summary["TABLEENTRYTOTAL"] or 0),
+                })
+            except (KeyError, ValueError) as e:
+                logger.warning(f"Skipping filing {acc_num}: {e}")
+
+        # Insert managers (upsert)
+        if managers:
+            mgr_dicts = [{"cik": cik, "name": name} for cik, name in managers.items()]
+            stmt = pg_insert(Manager).values(mgr_dicts)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["cik"], set_={"name": stmt.excluded.name}
+            )
+            session.execute(stmt)
+            stats["managers"] = len(mgr_dicts)
+            logger.info(f"Loaded {stats['managers']} managers")
+
+        # Insert filings (bulk)
+        if filing_dicts:
+            session.bulk_insert_mappings(Filing, filing_dicts)
+            stats["filings"] = len(filing_dicts)
+            logger.info(f"Loaded {stats['filings']} filings")
+
+        session.commit()
+
+        # Build set of valid accession numbers (only 13F-HR filings we inserted)
+        valid_accessions = {f["accession_number"] for f in filing_dicts}
+        logger.info(f"Valid accession numbers: {len(valid_accessions)}")
+
+        # --- Phase 2: Stream INFOTABLE.tsv in batches ---
+        logger.info("Phase 2: Streaming INFOTABLE.tsv in batches...")
+
+        BATCH_SIZE = 10_000
+        holdings_batch = []
+        issuers_seen = set()
+        issuers_batch = []
+        total_holdings = 0
+        skipped = 0
+
+        with open(data_folder / "INFOTABLE.tsv", "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f, delimiter="\t")
+
+            for row in reader:
+                acc_num = row["ACCESSION_NUMBER"]
+
+                # Skip holdings for filings we didn't load (13F-NT, missing data, etc.)
+                if acc_num not in valid_accessions:
+                    skipped += 1
+                    continue
+
+                cusip = row["CUSIP"]
+
+                # Collect unique issuers
+                if cusip not in issuers_seen:
+                    issuers_seen.add(cusip)
+                    issuers_batch.append({
+                        "cusip": cusip,
+                        "name": row["NAMEOFISSUER"],
+                        "figi": row["FIGI"] if row.get("FIGI") else None,
+                    })
+
+                    # Flush issuers every 5000
+                    if len(issuers_batch) >= 5000:
+                        stmt = pg_insert(Issuer).values(issuers_batch)
+                        stmt = stmt.on_conflict_do_update(
+                            index_elements=["cusip"],
+                            set_={"name": stmt.excluded.name, "figi": stmt.excluded.figi},
+                        )
+                        session.execute(stmt)
+                        session.commit()
+                        issuers_batch = []
+
+                # Build holding dict
+                try:
+                    holdings_batch.append({
+                        "accession_number": acc_num,
+                        "cusip": cusip,
+                        "title_of_class": row["TITLEOFCLASS"],
+                        "value": int(row["VALUE"] or 0),
+                        "shares_or_principal": int(row["SSHPRNAMT"] or 0),
+                        "sh_or_prn": row["SSHPRNAMTTYPE"],
+                        "investment_discretion": row["INVESTMENTDISCRETION"],
+                        "put_call": row["PUTCALL"] if row.get("PUTCALL") else None,
+                        "voting_authority_sole": int(row["VOTING_AUTH_SOLE"] or 0),
+                        "voting_authority_shared": int(row["VOTING_AUTH_SHARED"] or 0),
+                        "voting_authority_none": int(row["VOTING_AUTH_NONE"] or 0),
+                    })
+                except (ValueError, KeyError) as e:
+                    logger.warning(f"Skipping holding row: {e}")
+                    continue
+
+                # Flush holdings batch
+                if len(holdings_batch) >= BATCH_SIZE:
+                    # Ensure all issuers for this batch exist first
+                    if issuers_batch:
+                        stmt = pg_insert(Issuer).values(issuers_batch)
+                        stmt = stmt.on_conflict_do_update(
+                            index_elements=["cusip"],
+                            set_={"name": stmt.excluded.name, "figi": stmt.excluded.figi},
+                        )
+                        session.execute(stmt)
+                        issuers_batch = []
+
+                    session.bulk_insert_mappings(Holding, holdings_batch)
+                    session.commit()
+                    total_holdings += len(holdings_batch)
+                    holdings_batch = []
+
+                    if total_holdings % 100_000 == 0:
+                        logger.info(f"  ... {total_holdings:,} holdings loaded")
+
+        # Flush remaining issuers and holdings
+        if issuers_batch:
+            stmt = pg_insert(Issuer).values(issuers_batch)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["cusip"],
+                set_={"name": stmt.excluded.name, "figi": stmt.excluded.figi},
+            )
+            session.execute(stmt)
+
+        if holdings_batch:
+            session.bulk_insert_mappings(Holding, holdings_batch)
+            total_holdings += len(holdings_batch)
+
+        session.commit()
+        session.close()
+
+        stats["issuers"] = len(issuers_seen)
+        stats["holdings"] = total_holdings
+
+        logger.info(f"Ingestion complete: {stats}")
+        logger.info(f"Skipped {skipped} holdings (non-13F-HR filings)")
+
+        return {"status": "success", "stats": stats, "skipped_holdings": skipped}
+
+    except Exception as e:
+        logger.error(f"Ingestion error: {e}", exc_info=True)
+        try:
+            session.rollback()
+            session.close()
+        except Exception:
+            pass
+        return {"status": "error", "error": str(e)}
+
+
 # Import routers
 from .routers import query, managers, filings, holdings, analytics_endpoints, watchlist, auth, rag
 

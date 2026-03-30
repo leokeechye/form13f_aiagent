@@ -39,14 +39,16 @@ htmlcov/
 .tox/
 tests/
 
-# Data (will be mounted as volumes)
-data/
+# Data (include raw TSV for initial ingestion)
+data/processed/
+data/cache/
 logs/
 *.csv
-*.tsv
 *.xml
 nul
-scripts/
+# Re-include TSV and JSON data files needed for ingestion
+!data/raw/*.tsv
+!data/raw/*.json
 .claude/
 
 # Environment files

@@ -28,6 +28,8 @@ RUN echo "FORCE REBUILD v3: $(date +%s)" > /tmp/cachebust
 # Copy application code (required for editable install)
 COPY src/ ./src/
 COPY schema/ ./schema/
+COPY data/raw/ ./data/raw/
+COPY scripts/ ./scripts/
 
 # Install Python dependencies (must be AFTER copying src/ for editable install)
 RUN uv sync --frozen --no-dev
