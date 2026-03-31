@@ -295,6 +295,250 @@ async def get_stats():
         raise ValueError(f"Failed to get database statistics: {str(e)}")
 
 
+# Temporary data ingestion - REMOVE AFTER RE-INGESTION
+GITHUB_TSV_BASE = (
+    "https://media.githubusercontent.com/media/leokeechye/form13f_aiagent/main/data/raw"
+)
+
+_ingest_status = {"state": "idle", "detail": "", "stats": {}}
+
+
+def _run_ingestion_background():
+    """Background ingestion worker."""
+    import csv
+    import io
+    import subprocess
+    import tempfile
+    from datetime import datetime
+    from sqlalchemy import text as sa_text
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+    from src.db.session import SessionLocal
+    from src.db.models import Manager, Issuer, Filing, Holding
+
+    global _ingest_status
+    _ingest_status = {"state": "running", "detail": "Starting...", "stats": {}}
+    stats = {"managers": 0, "issuers": 0, "filings": 0, "holdings": 0}
+
+    def download_tsv(filename):
+        url = f"{GITHUB_TSV_BASE}/{filename}"
+        logger.info(f"Downloading {filename} from GitHub...")
+        _ingest_status["detail"] = f"Downloading {filename}..."
+        result = subprocess.run(
+            ["curl", "-sL", url], capture_output=True, text=True, timeout=300
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"Failed to download {filename}: {result.stderr}")
+        logger.info(f"Downloaded {filename} ({len(result.stdout):,} bytes)")
+        return result.stdout
+
+    def download_tsv_to_file(filename):
+        url = f"{GITHUB_TSV_BASE}/{filename}"
+        logger.info(f"Downloading {filename} from GitHub (streaming to disk)...")
+        _ingest_status["detail"] = f"Downloading {filename} (large file)..."
+        tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".tsv", delete=False)
+        result = subprocess.run(["curl", "-sL", "-o", tmp.name, url], timeout=600)
+        if result.returncode != 0:
+            raise RuntimeError(f"Failed to download {filename}")
+        import os as _os
+        size = _os.path.getsize(tmp.name)
+        logger.info(f"Downloaded {filename} ({size:,} bytes) to {tmp.name}")
+        return tmp.name
+
+    try:
+        session = SessionLocal()
+
+        _ingest_status["detail"] = "Truncating tables..."
+        logger.info("Truncating tables for clean ingestion...")
+        session.execute(sa_text("TRUNCATE TABLE holdings CASCADE"))
+        session.execute(sa_text("TRUNCATE TABLE filings CASCADE"))
+        session.execute(sa_text("TRUNCATE TABLE issuers CASCADE"))
+        session.execute(sa_text("TRUNCATE TABLE managers CASCADE"))
+        session.commit()
+
+        _ingest_status["detail"] = "Downloading small TSV files..."
+        def parse_tsv_string(content):
+            rows = {}
+            reader = csv.DictReader(io.StringIO(content), delimiter="\t")
+            for row in reader:
+                rows[row["ACCESSION_NUMBER"]] = row
+            return rows
+
+        submissions = parse_tsv_string(download_tsv("SUBMISSION.tsv"))
+        coverpages = parse_tsv_string(download_tsv("COVERPAGE.tsv"))
+        summaries = parse_tsv_string(download_tsv("SUMMARYPAGE.tsv"))
+
+        def parse_date(date_str):
+            return datetime.strptime(date_str, "%d-%b-%Y").date()
+
+        _ingest_status["detail"] = "Inserting managers and filings..."
+        managers = {}
+        filing_dicts = []
+
+        for acc_num, sub in submissions.items():
+            if sub["SUBMISSIONTYPE"] != "13F-HR":
+                continue
+            cover = coverpages.get(acc_num)
+            summary = summaries.get(acc_num)
+            if not cover or not summary:
+                continue
+            try:
+                cik = sub["CIK"]
+                managers[cik] = cover["FILINGMANAGER_NAME"]
+                filing_dicts.append({
+                    "accession_number": acc_num,
+                    "cik": cik,
+                    "filing_date": parse_date(sub["FILING_DATE"]),
+                    "period_of_report": parse_date(sub["PERIODOFREPORT"]),
+                    "submission_type": sub["SUBMISSIONTYPE"],
+                    "report_type": cover["REPORTTYPE"],
+                    "total_value": int(summary["TABLEVALUETOTAL"] or 0),
+                    "number_of_holdings": int(summary["TABLEENTRYTOTAL"] or 0),
+                })
+            except (KeyError, ValueError) as e:
+                logger.warning(f"Skipping filing {acc_num}: {e}")
+
+        if managers:
+            mgr_dicts = [{"cik": cik, "name": name} for cik, name in managers.items()]
+            stmt = pg_insert(Manager).values(mgr_dicts)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["cik"], set_={"name": stmt.excluded.name}
+            )
+            session.execute(stmt)
+            stats["managers"] = len(mgr_dicts)
+
+        if filing_dicts:
+            session.bulk_insert_mappings(Filing, filing_dicts)
+            stats["filings"] = len(filing_dicts)
+
+        session.commit()
+        valid_accessions = {f["accession_number"] for f in filing_dicts}
+        del submissions, coverpages, summaries, filing_dicts
+
+        _ingest_status["detail"] = "Downloading INFOTABLE.tsv (~343MB)..."
+        infotable_path = download_tsv_to_file("INFOTABLE.tsv")
+
+        BATCH_SIZE = 10_000
+        holdings_batch = []
+        issuers_seen = set()
+        issuers_batch = []
+        total_holdings = 0
+        skipped = 0
+
+        with open(infotable_path, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f, delimiter="\t")
+            for row in reader:
+                acc_num = row["ACCESSION_NUMBER"]
+                if acc_num not in valid_accessions:
+                    skipped += 1
+                    continue
+
+                cusip = row["CUSIP"]
+                if cusip not in issuers_seen:
+                    issuers_seen.add(cusip)
+                    issuers_batch.append({
+                        "cusip": cusip,
+                        "name": row["NAMEOFISSUER"],
+                        "figi": row["FIGI"] if row.get("FIGI") else None,
+                    })
+                    if len(issuers_batch) >= 5000:
+                        stmt = pg_insert(Issuer).values(issuers_batch)
+                        stmt = stmt.on_conflict_do_update(
+                            index_elements=["cusip"],
+                            set_={"name": stmt.excluded.name, "figi": stmt.excluded.figi},
+                        )
+                        session.execute(stmt)
+                        session.commit()
+                        issuers_batch = []
+
+                try:
+                    holdings_batch.append({
+                        "accession_number": acc_num,
+                        "cusip": cusip,
+                        "title_of_class": row["TITLEOFCLASS"],
+                        "value": int(row["VALUE"] or 0),
+                        "shares_or_principal": int(row["SSHPRNAMT"] or 0),
+                        "sh_or_prn": row["SSHPRNAMTTYPE"],
+                        "investment_discretion": row["INVESTMENTDISCRETION"],
+                        "put_call": row["PUTCALL"] if row.get("PUTCALL") else None,
+                        "voting_authority_sole": int(row["VOTING_AUTH_SOLE"] or 0),
+                        "voting_authority_shared": int(row["VOTING_AUTH_SHARED"] or 0),
+                        "voting_authority_none": int(row["VOTING_AUTH_NONE"] or 0),
+                    })
+                except (ValueError, KeyError):
+                    continue
+
+                if len(holdings_batch) >= BATCH_SIZE:
+                    if issuers_batch:
+                        stmt = pg_insert(Issuer).values(issuers_batch)
+                        stmt = stmt.on_conflict_do_update(
+                            index_elements=["cusip"],
+                            set_={"name": stmt.excluded.name, "figi": stmt.excluded.figi},
+                        )
+                        session.execute(stmt)
+                        issuers_batch = []
+                    session.bulk_insert_mappings(Holding, holdings_batch)
+                    session.commit()
+                    total_holdings += len(holdings_batch)
+                    holdings_batch = []
+                    if total_holdings % 100_000 == 0:
+                        _ingest_status["detail"] = f"{total_holdings:,} holdings loaded..."
+                        _ingest_status["stats"] = {**stats, "holdings": total_holdings}
+                        logger.info(f"  ... {total_holdings:,} holdings loaded")
+
+        if issuers_batch:
+            stmt = pg_insert(Issuer).values(issuers_batch)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["cusip"],
+                set_={"name": stmt.excluded.name, "figi": stmt.excluded.figi},
+            )
+            session.execute(stmt)
+        if holdings_batch:
+            session.bulk_insert_mappings(Holding, holdings_batch)
+            total_holdings += len(holdings_batch)
+
+        session.commit()
+        session.close()
+
+        import os as _os
+        _os.unlink(infotable_path)
+
+        stats["issuers"] = len(issuers_seen)
+        stats["holdings"] = total_holdings
+        _ingest_status = {
+            "state": "completed",
+            "detail": f"Done! {total_holdings:,} holdings loaded",
+            "stats": stats,
+            "skipped_holdings": skipped,
+        }
+        logger.info(f"Ingestion complete: {stats}")
+
+    except Exception as e:
+        logger.error(f"Ingestion error: {e}", exc_info=True)
+        _ingest_status = {"state": "error", "detail": str(e), "stats": stats}
+        try:
+            session.rollback()
+            session.close()
+        except Exception:
+            pass
+
+
+@app.post("/api/v1/ingest", tags=["Admin"])
+async def start_ingestion():
+    """Start background ingestion."""
+    import threading
+    if _ingest_status["state"] == "running":
+        return {"status": "already_running", "detail": _ingest_status["detail"]}
+    thread = threading.Thread(target=_run_ingestion_background, daemon=True)
+    thread.start()
+    return {"status": "started", "message": "Check GET /api/v1/ingest/status"}
+
+
+@app.get("/api/v1/ingest/status", tags=["Admin"])
+async def ingestion_status():
+    """Check ingestion status."""
+    return _ingest_status
+
+
 # Analytics and cache endpoints
 from .analytics import analytics
 from .cache import query_cache
