@@ -252,7 +252,7 @@ async def summarize_results(request: SummarizeRequest):
 
         # Get LLM configuration
         llm_provider = os.getenv("LLM_PROVIDER", "anthropic")
-        llm_model = os.getenv("LLM_MODEL", "claude-3-5-sonnet-20241022")
+        llm_model = os.getenv("LLM_MODEL", "claude-sonnet-4-5-20250514")
         model_name = f"{llm_provider}/{llm_model}"
 
         # Create prompt

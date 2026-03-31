@@ -37,7 +37,7 @@ RUN useradd -m -u 1000 appuser && \
     chown -R appuser:appuser /app
 
 # Create data directories
-RUN mkdir -p data/raw data/processed data/cache && \
+RUN mkdir -p data/cache && \
     chown -R appuser:appuser data/
 
 USER appuser
