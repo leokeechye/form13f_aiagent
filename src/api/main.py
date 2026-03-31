@@ -409,35 +409,35 @@ async def clear_cache():
     return {"status": "success", "message": "Cache cleared"}
 
 
-# Temporary data ingestion endpoint - remove after initial setup
+# Temporary data ingestion - remove after initial setup
 # Downloads TSV data from GitHub LFS and streams into database in batches
 GITHUB_TSV_BASE = (
     "https://media.githubusercontent.com/media/leokeechye/form13f_aiagent/main/data/raw"
 )
 
+# Global ingestion status tracker
+_ingest_status = {"state": "idle", "detail": "", "stats": {}}
 
-@app.post("/api/v1/ingest", tags=["Admin"])
-async def run_ingestion():
-    """
-    Download 13F TSV data from GitHub and load into database using streaming batch inserts.
-    Memory-efficient: streams INFOTABLE.tsv line-by-line in 10K-row batches.
-    Remove this endpoint after initial setup.
-    """
+
+def _run_ingestion_background():
+    """Background ingestion worker. Updates _ingest_status as it progresses."""
     import csv
     import io
     import subprocess
     import tempfile
     from datetime import datetime
     from sqlalchemy.dialects.postgresql import insert as pg_insert
-    from ..db.session import SessionLocal
-    from ..db.models import Manager, Issuer, Filing, Holding
+    from src.db.session import SessionLocal
+    from src.db.models import Manager, Issuer, Filing, Holding
 
+    global _ingest_status
+    _ingest_status = {"state": "running", "detail": "Starting...", "stats": {}}
     stats = {"managers": 0, "issuers": 0, "filings": 0, "holdings": 0}
 
     def download_tsv(filename):
-        """Download a TSV file from GitHub LFS and return as string."""
         url = f"{GITHUB_TSV_BASE}/{filename}"
         logger.info(f"Downloading {filename} from GitHub...")
+        _ingest_status["detail"] = f"Downloading {filename}..."
         result = subprocess.run(
             ["curl", "-sL", url], capture_output=True, text=True, timeout=300
         )
@@ -447,17 +447,17 @@ async def run_ingestion():
         return result.stdout
 
     def download_tsv_to_file(filename):
-        """Download a large TSV file to a temp file, return the path."""
         url = f"{GITHUB_TSV_BASE}/{filename}"
         logger.info(f"Downloading {filename} from GitHub (streaming to disk)...")
+        _ingest_status["detail"] = f"Downloading {filename} (large file)..."
         tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".tsv", delete=False)
         result = subprocess.run(
             ["curl", "-sL", "-o", tmp.name, url], timeout=600
         )
         if result.returncode != 0:
             raise RuntimeError(f"Failed to download {filename}")
-        import os
-        size = os.path.getsize(tmp.name)
+        import os as _os
+        size = _os.path.getsize(tmp.name)
         logger.info(f"Downloaded {filename} ({size:,} bytes) to {tmp.name}")
         return tmp.name
 
@@ -465,6 +465,7 @@ async def run_ingestion():
         session = SessionLocal()
 
         # --- Phase 1: Download and parse small files ---
+        _ingest_status["detail"] = "Phase 1: Downloading small TSV files..."
         logger.info("Phase 1: Downloading and parsing small TSV files...")
 
         def parse_tsv_string(content):
@@ -481,7 +482,7 @@ async def run_ingestion():
         def parse_date(date_str):
             return datetime.strptime(date_str, "%d-%b-%Y").date()
 
-        # Build managers and filings
+        _ingest_status["detail"] = "Phase 1: Inserting managers and filings..."
         managers = {}
         filing_dicts = []
 
@@ -508,7 +509,6 @@ async def run_ingestion():
             except (KeyError, ValueError) as e:
                 logger.warning(f"Skipping filing {acc_num}: {e}")
 
-        # Insert managers (upsert)
         if managers:
             mgr_dicts = [{"cik": cik, "name": name} for cik, name in managers.items()]
             stmt = pg_insert(Manager).values(mgr_dicts)
@@ -519,7 +519,6 @@ async def run_ingestion():
             stats["managers"] = len(mgr_dicts)
             logger.info(f"Loaded {stats['managers']} managers")
 
-        # Insert filings (bulk)
         if filing_dicts:
             session.bulk_insert_mappings(Filing, filing_dicts)
             stats["filings"] = len(filing_dicts)
@@ -527,14 +526,12 @@ async def run_ingestion():
 
         session.commit()
 
-        # Build set of valid accession numbers
         valid_accessions = {f["accession_number"] for f in filing_dicts}
         logger.info(f"Valid accession numbers: {len(valid_accessions)}")
-
-        # Free memory from phase 1
         del submissions, coverpages, summaries, filing_dicts
 
         # --- Phase 2: Download INFOTABLE.tsv to disk and stream in batches ---
+        _ingest_status["detail"] = "Phase 2: Downloading INFOTABLE.tsv (~330MB)..."
         logger.info("Phase 2: Downloading and streaming INFOTABLE.tsv...")
         infotable_path = download_tsv_to_file("INFOTABLE.tsv")
 
@@ -545,20 +542,19 @@ async def run_ingestion():
         total_holdings = 0
         skipped = 0
 
+        _ingest_status["detail"] = "Phase 2: Inserting holdings in batches..."
+
         with open(infotable_path, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f, delimiter="\t")
 
             for row in reader:
                 acc_num = row["ACCESSION_NUMBER"]
-
-                # Skip holdings for filings we didn't load
                 if acc_num not in valid_accessions:
                     skipped += 1
                     continue
 
                 cusip = row["CUSIP"]
 
-                # Collect unique issuers
                 if cusip not in issuers_seen:
                     issuers_seen.add(cusip)
                     issuers_batch.append({
@@ -566,8 +562,6 @@ async def run_ingestion():
                         "name": row["NAMEOFISSUER"],
                         "figi": row["FIGI"] if row.get("FIGI") else None,
                     })
-
-                    # Flush issuers every 5000
                     if len(issuers_batch) >= 5000:
                         stmt = pg_insert(Issuer).values(issuers_batch)
                         stmt = stmt.on_conflict_do_update(
@@ -578,7 +572,6 @@ async def run_ingestion():
                         session.commit()
                         issuers_batch = []
 
-                # Build holding dict
                 try:
                     holdings_batch.append({
                         "accession_number": acc_num,
@@ -597,7 +590,6 @@ async def run_ingestion():
                     logger.warning(f"Skipping holding row: {e}")
                     continue
 
-                # Flush holdings batch
                 if len(holdings_batch) >= BATCH_SIZE:
                     if issuers_batch:
                         stmt = pg_insert(Issuer).values(issuers_batch)
@@ -614,6 +606,10 @@ async def run_ingestion():
                     holdings_batch = []
 
                     if total_holdings % 100_000 == 0:
+                        _ingest_status["detail"] = (
+                            f"Phase 2: {total_holdings:,} holdings loaded..."
+                        )
+                        _ingest_status["stats"] = {**stats, "holdings": total_holdings}
                         logger.info(f"  ... {total_holdings:,} holdings loaded")
 
         # Flush remaining
@@ -633,25 +629,49 @@ async def run_ingestion():
         session.close()
 
         # Clean up temp file
-        import os
-        os.unlink(infotable_path)
+        import os as _os
+        _os.unlink(infotable_path)
 
         stats["issuers"] = len(issuers_seen)
         stats["holdings"] = total_holdings
 
+        _ingest_status = {
+            "state": "completed",
+            "detail": f"Done! {total_holdings:,} holdings loaded",
+            "stats": stats,
+            "skipped_holdings": skipped,
+        }
         logger.info(f"Ingestion complete: {stats}")
         logger.info(f"Skipped {skipped} holdings (non-13F-HR filings)")
 
-        return {"status": "success", "stats": stats, "skipped_holdings": skipped}
-
     except Exception as e:
         logger.error(f"Ingestion error: {e}", exc_info=True)
+        _ingest_status = {"state": "error", "detail": str(e), "stats": stats}
         try:
             session.rollback()
             session.close()
         except Exception:
             pass
-        return {"status": "error", "error": str(e)}
+
+
+@app.post("/api/v1/ingest", tags=["Admin"])
+async def start_ingestion():
+    """Start background ingestion. Check progress at GET /api/v1/ingest/status."""
+    import threading
+
+    if _ingest_status["state"] == "running":
+        return {"status": "already_running", "detail": _ingest_status["detail"]}
+
+    thread = threading.Thread(target=_run_ingestion_background, daemon=True)
+    thread.start()
+
+    return {"status": "started", "message": "Ingestion started in background. Check GET /api/v1/ingest/status for progress."}
+
+
+@app.get("/api/v1/ingest/status", tags=["Admin"])
+async def ingestion_status():
+    """Check the status of background ingestion."""
+    return _ingest_status
 
 
 # Import routers
