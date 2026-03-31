@@ -59,7 +59,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     try:
         import os
         llm_provider = os.getenv("LLM_PROVIDER", "anthropic")
-        llm_model = os.getenv("LLM_MODEL", "claude-sonnet-4-5-20250514")
+        llm_model = os.getenv("LLM_MODEL", "claude-sonnet-4-20250514")
         api_key = os.getenv("ANTHROPIC_API_KEY") or os.getenv("OPENAI_API_KEY")
 
         if api_key and api_key != "sk-ant-your-key-here":

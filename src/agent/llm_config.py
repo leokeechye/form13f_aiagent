@@ -16,7 +16,7 @@ Supported providers:
 
 Environment variables required:
 - LLM_PROVIDER: Provider name (e.g., "anthropic", "openai", "azure")
-- LLM_MODEL: Model identifier (e.g., "claude-sonnet-4-5-20250514", "gpt-4", "gemini-pro")
+- LLM_MODEL: Model identifier (e.g., "claude-sonnet-4-20250514", "gpt-4", "gemini-pro")
 - LLM_API_KEY: API key for the provider (or provider-specific key like ANTHROPIC_API_KEY)
 - LLM_BASE_URL: (Optional) Custom base URL for self-hosted or proxy endpoints
 - LLM_MAX_TOKENS: (Optional) Max tokens for responses (default: 4096)
@@ -36,7 +36,7 @@ class LLMSettings(BaseSettings):
     # Provider and model
     llm_provider: str = Field(default="anthropic", description="LLM provider name")
     llm_model: str = Field(
-        default="claude-sonnet-4-5-20250514",
+        default="claude-sonnet-4-20250514",
         description="Model identifier"
     )
 
@@ -125,7 +125,7 @@ class LLMClient:
         Format: "provider/model" or just "model" for OpenAI-compatible APIs
 
         Examples:
-        - "anthropic/claude-sonnet-4-5-20250514"
+        - "anthropic/claude-sonnet-4-20250514"
         - "gpt-4" (OpenAI default)
         - "azure/gpt-4"
         - "gemini/gemini-pro"
