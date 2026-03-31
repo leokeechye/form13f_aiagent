@@ -1,6 +1,0 @@
-# Railway Configuration
-# https://docs.railway.app/deploy/config-as-code
-
-[build]
-builder = "DOCKERFILE"
-dockerfilePath = "Dockerfile"
