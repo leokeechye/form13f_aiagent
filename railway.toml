@@ -4,15 +4,3 @@
 [build]
 builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"
-
-[deploy]
-healthcheckPath = "/health"
-healthcheckTimeout = 300
-restartPolicyType = "ON_FAILURE"
-restartPolicyMaxRetries = 10
-
-[[services]]
-name = "api"
-
-# Note: Railway will automatically detect and use your Dockerfile
-# No need to specify build command if using Dockerfile
