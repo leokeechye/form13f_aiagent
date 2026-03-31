@@ -410,47 +410,78 @@ async def clear_cache():
 
 
 # Temporary data ingestion endpoint - remove after initial setup
+# Downloads TSV data from GitHub LFS and streams into database in batches
+GITHUB_TSV_BASE = (
+    "https://media.githubusercontent.com/media/leokeechye/form13f_aiagent/main/data/raw"
+)
+
+
 @app.post("/api/v1/ingest", tags=["Admin"])
 async def run_ingestion():
     """
-    Load 13F TSV data into database using streaming batch inserts.
-    Memory-efficient: streams INFOTABLE.tsv in batches instead of loading all at once.
+    Download 13F TSV data from GitHub and load into database using streaming batch inserts.
+    Memory-efficient: streams INFOTABLE.tsv line-by-line in 10K-row batches.
     Remove this endpoint after initial setup.
     """
     import csv
-    from pathlib import Path
+    import io
+    import subprocess
+    import tempfile
     from datetime import datetime
     from sqlalchemy.dialects.postgresql import insert as pg_insert
     from ..db.session import SessionLocal
     from ..db.models import Manager, Issuer, Filing, Holding
 
-    data_folder = Path("/app/data/raw")
-    if not data_folder.exists():
-        return {"error": f"Data folder not found: {data_folder}"}
-
     stats = {"managers": 0, "issuers": 0, "filings": 0, "holdings": 0}
+
+    def download_tsv(filename):
+        """Download a TSV file from GitHub LFS and return as string."""
+        url = f"{GITHUB_TSV_BASE}/{filename}"
+        logger.info(f"Downloading {filename} from GitHub...")
+        result = subprocess.run(
+            ["curl", "-sL", url], capture_output=True, text=True, timeout=300
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"Failed to download {filename}: {result.stderr}")
+        logger.info(f"Downloaded {filename} ({len(result.stdout):,} bytes)")
+        return result.stdout
+
+    def download_tsv_to_file(filename):
+        """Download a large TSV file to a temp file, return the path."""
+        url = f"{GITHUB_TSV_BASE}/{filename}"
+        logger.info(f"Downloading {filename} from GitHub (streaming to disk)...")
+        tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".tsv", delete=False)
+        result = subprocess.run(
+            ["curl", "-sL", "-o", tmp.name, url], timeout=600
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"Failed to download {filename}")
+        import os
+        size = os.path.getsize(tmp.name)
+        logger.info(f"Downloaded {filename} ({size:,} bytes) to {tmp.name}")
+        return tmp.name
 
     try:
         session = SessionLocal()
 
-        # --- Phase 1: Parse small files (SUBMISSION, COVERPAGE, SUMMARYPAGE) ---
-        logger.info("Phase 1: Loading submissions, coverpages, summaries...")
+        # --- Phase 1: Download and parse small files ---
+        logger.info("Phase 1: Downloading and parsing small TSV files...")
 
-        def read_tsv(filename):
+        def parse_tsv_string(content):
             rows = {}
-            with open(data_folder / filename, "r", encoding="utf-8") as f:
-                for row in csv.DictReader(f, delimiter="\t"):
-                    rows[row["ACCESSION_NUMBER"]] = row
+            reader = csv.DictReader(io.StringIO(content), delimiter="\t")
+            for row in reader:
+                rows[row["ACCESSION_NUMBER"]] = row
             return rows
 
-        submissions = read_tsv("SUBMISSION.tsv")
-        coverpages = read_tsv("COVERPAGE.tsv")
-        summaries = read_tsv("SUMMARYPAGE.tsv")
+        submissions = parse_tsv_string(download_tsv("SUBMISSION.tsv"))
+        coverpages = parse_tsv_string(download_tsv("COVERPAGE.tsv"))
+        summaries = parse_tsv_string(download_tsv("SUMMARYPAGE.tsv"))
 
         def parse_date(date_str):
             return datetime.strptime(date_str, "%d-%b-%Y").date()
 
-        # Build managers and filings from small files
+        # Build managers and filings
         managers = {}
         filing_dicts = []
 
@@ -496,12 +527,16 @@ async def run_ingestion():
 
         session.commit()
 
-        # Build set of valid accession numbers (only 13F-HR filings we inserted)
+        # Build set of valid accession numbers
         valid_accessions = {f["accession_number"] for f in filing_dicts}
         logger.info(f"Valid accession numbers: {len(valid_accessions)}")
 
-        # --- Phase 2: Stream INFOTABLE.tsv in batches ---
-        logger.info("Phase 2: Streaming INFOTABLE.tsv in batches...")
+        # Free memory from phase 1
+        del submissions, coverpages, summaries, filing_dicts
+
+        # --- Phase 2: Download INFOTABLE.tsv to disk and stream in batches ---
+        logger.info("Phase 2: Downloading and streaming INFOTABLE.tsv...")
+        infotable_path = download_tsv_to_file("INFOTABLE.tsv")
 
         BATCH_SIZE = 10_000
         holdings_batch = []
@@ -510,13 +545,13 @@ async def run_ingestion():
         total_holdings = 0
         skipped = 0
 
-        with open(data_folder / "INFOTABLE.tsv", "r", encoding="utf-8") as f:
+        with open(infotable_path, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f, delimiter="\t")
 
             for row in reader:
                 acc_num = row["ACCESSION_NUMBER"]
 
-                # Skip holdings for filings we didn't load (13F-NT, missing data, etc.)
+                # Skip holdings for filings we didn't load
                 if acc_num not in valid_accessions:
                     skipped += 1
                     continue
@@ -564,7 +599,6 @@ async def run_ingestion():
 
                 # Flush holdings batch
                 if len(holdings_batch) >= BATCH_SIZE:
-                    # Ensure all issuers for this batch exist first
                     if issuers_batch:
                         stmt = pg_insert(Issuer).values(issuers_batch)
                         stmt = stmt.on_conflict_do_update(
@@ -582,7 +616,7 @@ async def run_ingestion():
                     if total_holdings % 100_000 == 0:
                         logger.info(f"  ... {total_holdings:,} holdings loaded")
 
-        # Flush remaining issuers and holdings
+        # Flush remaining
         if issuers_batch:
             stmt = pg_insert(Issuer).values(issuers_batch)
             stmt = stmt.on_conflict_do_update(
@@ -597,6 +631,10 @@ async def run_ingestion():
 
         session.commit()
         session.close()
+
+        # Clean up temp file
+        import os
+        os.unlink(infotable_path)
 
         stats["issuers"] = len(issuers_seen)
         stats["holdings"] = total_holdings
