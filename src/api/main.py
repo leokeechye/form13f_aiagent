@@ -426,6 +426,7 @@ def _run_ingestion_background():
     import subprocess
     import tempfile
     from datetime import datetime
+    from sqlalchemy import text as sa_text
     from sqlalchemy.dialects.postgresql import insert as pg_insert
     from src.db.session import SessionLocal
     from src.db.models import Manager, Issuer, Filing, Holding
@@ -463,6 +464,16 @@ def _run_ingestion_background():
 
     try:
         session = SessionLocal()
+
+        # --- Phase 0: Truncate existing data (clean slate) ---
+        _ingest_status["detail"] = "Phase 0: Clearing existing data..."
+        logger.info("Phase 0: Truncating tables for clean ingestion...")
+        session.execute(sa_text("TRUNCATE TABLE holdings CASCADE"))
+        session.execute(sa_text("TRUNCATE TABLE filings CASCADE"))
+        session.execute(sa_text("TRUNCATE TABLE issuers CASCADE"))
+        session.execute(sa_text("TRUNCATE TABLE managers CASCADE"))
+        session.commit()
+        logger.info("Tables truncated successfully")
 
         # --- Phase 1: Download and parse small files ---
         _ingest_status["detail"] = "Phase 1: Downloading small TSV files..."
