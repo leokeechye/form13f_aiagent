@@ -22,8 +22,8 @@ COPY pyproject.toml ./
 COPY uv.lock ./
 
 # FORCE CACHE INVALIDATION - timestamp changes every build
-ARG CACHEBUST_V4=1
-RUN echo "FORCE REBUILD v4: $(date +%s)" > /tmp/cachebust
+ARG CACHEBUST_V5=1
+RUN echo "FORCE REBUILD v5: $(date +%s)" > /tmp/cachebust
 
 # Copy application code (required for editable install)
 COPY src/ ./src/
