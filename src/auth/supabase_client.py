@@ -7,7 +7,9 @@ Provides Supabase client initialization and helper functions for auth.
 import os
 from typing import Optional, Dict, Any
 from supabase import create_client, Client
+from supabase.lib.client_options import SyncClientOptions
 from dotenv import load_dotenv
+import httpx
 import logging
 
 logger = logging.getLogger(__name__)
@@ -42,7 +44,13 @@ def get_supabase_client() -> Client:
                 "Set SUPABASE_URL and SUPABASE_ANON_KEY environment variables."
             )
 
-        _supabase_client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+        _supabase_client = create_client(
+            SUPABASE_URL,
+            SUPABASE_ANON_KEY,
+            options=SyncClientOptions(
+                httpx_client=httpx.Client(timeout=httpx.Timeout(30.0)),
+            ),
+        )
         logger.info("Supabase client initialized")
 
     return _supabase_client
