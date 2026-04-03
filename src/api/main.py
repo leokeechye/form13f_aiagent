@@ -242,55 +242,6 @@ async def health_check():
     )
 
 
-# Temporary diagnostic endpoint for Supabase Auth connectivity
-@app.get("/debug/auth-connectivity", tags=["Debug"])
-async def debug_auth_connectivity():
-    """Diagnose Supabase Auth connectivity from Railway. TEMPORARY - remove after debugging."""
-    import os
-    import httpx
-    import socket
-
-    supabase_url = os.getenv("SUPABASE_URL", "")
-    supabase_key = os.getenv("SUPABASE_ANON_KEY", "")
-    results = {"supabase_url": supabase_url}
-
-    # 1. DNS resolution
-    try:
-        hostname = supabase_url.replace("https://", "").replace("http://", "").rstrip("/")
-        addrs = socket.getaddrinfo(hostname, 443)
-        results["dns"] = {
-            "status": "ok",
-            "addresses": list(set(f"{a[4][0]} ({a[0].name})" for a in addrs)),
-        }
-    except Exception as e:
-        results["dns"] = {"status": "error", "error": str(e)}
-
-    # 2. HTTPS connectivity to auth health endpoint
-    try:
-        r = httpx.get(
-            f"{supabase_url}/auth/v1/health",
-            headers={"apikey": supabase_key},
-            timeout=httpx.Timeout(15.0, connect=10.0),
-        )
-        results["auth_health"] = {"status": r.status_code, "body": r.text[:200]}
-    except Exception as e:
-        results["auth_health"] = {"status": "error", "error": f"{type(e).__name__}: {e}"}
-
-    # 3. Test with IPv4 only
-    try:
-        transport = httpx.HTTPTransport(local_address="0.0.0.0")
-        with httpx.Client(transport=transport, timeout=httpx.Timeout(15.0, connect=10.0)) as client:
-            r = client.get(
-                f"{supabase_url}/auth/v1/health",
-                headers={"apikey": supabase_key},
-            )
-            results["auth_health_ipv4"] = {"status": r.status_code, "body": r.text[:200]}
-    except Exception as e:
-        results["auth_health_ipv4"] = {"status": "error", "error": f"{type(e).__name__}: {e}"}
-
-    return results
-
-
 # Database stats endpoint
 @app.get("/api/v1/stats", response_model=DatabaseStatsResponse, tags=["Statistics"])
 async def get_stats():
