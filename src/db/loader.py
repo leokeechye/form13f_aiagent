@@ -97,19 +97,43 @@ class Form13FDatabaseLoader:
         issuers = self._extract_issuers(parsed_filings)
         stats["issuers"] = self._load_issuers(issuers, show_progress)
 
-        # Step 3: Load filings
+        # Step 3: Load filings (returns set of newly inserted accession numbers)
         print("\n3. Loading filings...")
+        new_accessions = self._get_new_accession_numbers(parsed_filings)
         stats["filings"] = self._load_filings(parsed_filings, show_progress)
 
-        # Step 4: Load holdings
+        # Step 4: Load holdings (only for new filings)
         print("\n4. Loading holdings...")
-        stats["holdings"] = self._load_holdings(parsed_filings, show_progress)
+        new_filings = [f for f in parsed_filings if f.metadata.accession_number in new_accessions]
+        skipped = len(parsed_filings) - len(new_filings)
+        if skipped > 0:
+            print(f"   Skipping holdings for {skipped:,} existing filings")
+        stats["holdings"] = self._load_holdings(new_filings, show_progress)
 
         # Commit transaction
         self.session.commit()
         print("\n✓ All data loaded successfully!")
 
         return stats
+
+    def _get_new_accession_numbers(self, parsed_filings: list[ParsedFiling]) -> Set[str]:
+        """Determine which accession numbers don't exist in the database yet."""
+        all_accessions = {f.metadata.accession_number for f in parsed_filings}
+
+        # Query existing accession numbers in batches
+        existing = set()
+        accession_list = list(all_accessions)
+        batch_size = 500
+        for i in range(0, len(accession_list), batch_size):
+            batch = accession_list[i:i + batch_size]
+            rows = self.session.query(Filing.accession_number).filter(
+                Filing.accession_number.in_(batch)
+            ).all()
+            existing.update(row[0] for row in rows)
+
+        new = all_accessions - existing
+        print(f"   Found {len(new):,} new filings out of {len(all_accessions):,} total")
+        return new
 
     def _extract_managers(self, parsed_filings: list[ParsedFiling]) -> Dict[str, str]:
         """Extract unique managers from filings."""
@@ -180,7 +204,7 @@ class Form13FDatabaseLoader:
         return len(issuer_dicts)
 
     def _load_filings(self, parsed_filings: list[ParsedFiling], show_progress: bool) -> int:
-        """Load filings using bulk insert."""
+        """Load filings using upsert (skip duplicates)."""
         filing_dicts = []
 
         iterator = tqdm(parsed_filings, desc="Preparing filings") if show_progress else parsed_filings
@@ -201,9 +225,16 @@ class Form13FDatabaseLoader:
         if not filing_dicts:
             return 0
 
-        # Bulk insert
-        self.session.bulk_insert_mappings(Filing, filing_dicts)
-        return len(filing_dicts)
+        # Upsert in batches - skip existing filings
+        batch_size = 1000
+        inserted = 0
+        for i in range(0, len(filing_dicts), batch_size):
+            batch = filing_dicts[i:i + batch_size]
+            stmt = insert(Filing).values(batch)
+            stmt = stmt.on_conflict_do_nothing(index_elements=['accession_number'])
+            result = self.session.execute(stmt)
+            inserted += result.rowcount
+        return inserted
 
     def _load_holdings(self, parsed_filings: list[ParsedFiling], show_progress: bool) -> int:
         """Load holdings using bulk insert."""
