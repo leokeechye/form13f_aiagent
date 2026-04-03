@@ -1,7 +1,8 @@
 """
 Supabase Client for Authentication.
 
-Provides Supabase client initialization and helper functions for auth.
+Uses direct HTTP calls to Supabase Auth REST API for reliable timeout control,
+and the Supabase SDK for token verification.
 """
 
 import os
@@ -21,13 +22,25 @@ load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
 
+# Auth timeout for direct HTTP calls to Supabase Auth API
+AUTH_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
+
 # Singleton instance
 _supabase_client: Optional[Client] = None
+
+
+def _get_auth_headers() -> Dict[str, str]:
+    """Get headers for direct Supabase Auth API calls."""
+    return {
+        "apikey": SUPABASE_ANON_KEY,
+        "Content-Type": "application/json",
+    }
 
 
 def get_supabase_client() -> Client:
     """
     Get or create Supabase client instance (singleton pattern).
+    Used for token verification only.
 
     Returns:
         Supabase Client instance
@@ -48,7 +61,11 @@ def get_supabase_client() -> Client:
             SUPABASE_URL,
             SUPABASE_ANON_KEY,
             options=SyncClientOptions(
-                httpx_client=httpx.Client(timeout=httpx.Timeout(30.0)),
+                httpx_client=httpx.Client(
+                    timeout=AUTH_TIMEOUT,
+                    follow_redirects=True,
+                    http2=True,
+                ),
             ),
         )
         logger.info("Supabase client initialized")
@@ -67,16 +84,22 @@ def verify_token(token: str) -> Optional[Dict[str, Any]]:
         User info dict if valid, None if invalid
     """
     try:
-        client = get_supabase_client()
+        # Use direct API call for token verification too
+        response = httpx.get(
+            f"{SUPABASE_URL}/auth/v1/user",
+            headers={
+                **_get_auth_headers(),
+                "Authorization": f"Bearer {token}",
+            },
+            timeout=AUTH_TIMEOUT,
+        )
 
-        # Verify token by getting user info
-        response = client.auth.get_user(token)
-
-        if response and response.user:
+        if response.status_code == 200:
+            user = response.json()
             return {
-                "id": response.user.id,
-                "email": response.user.email,
-                "created_at": response.user.created_at,
+                "id": user.get("id"),
+                "email": user.get("email"),
+                "created_at": user.get("created_at"),
             }
 
         return None
@@ -103,6 +126,7 @@ def get_user_from_token(token: str) -> Optional[str]:
 def sign_up(email: str, password: str) -> Dict[str, Any]:
     """
     Register a new user with email and password.
+    Uses direct HTTP call to Supabase Auth REST API.
 
     Args:
         email: User's email address
@@ -112,49 +136,57 @@ def sign_up(email: str, password: str) -> Dict[str, Any]:
         Dict with 'success' boolean and 'user' or 'error' info
     """
     try:
-        client = get_supabase_client()
+        response = httpx.post(
+            f"{SUPABASE_URL}/auth/v1/signup",
+            headers=_get_auth_headers(),
+            json={"email": email, "password": password},
+            timeout=AUTH_TIMEOUT,
+        )
 
-        response = client.auth.sign_up({
-            "email": email,
-            "password": password
-        })
+        data = response.json()
 
-        if response.user:
+        if response.status_code in (200, 201):
+            user = data.get("user") or data
+            user_id = user.get("id")
+            user_email = user.get("email", email)
+
+            if not user_id:
+                return {"success": False, "error": "Sign up failed - no user returned"}
+
             result = {
                 "success": True,
-                "user": {
-                    "id": response.user.id,
-                    "email": response.user.email
-                }
+                "user": {"id": user_id, "email": user_email},
             }
 
-            # Include session if available (email confirmation might be required)
-            if response.session and response.session.access_token:
+            access_token = data.get("access_token")
+            if access_token:
                 result["session"] = {
-                    "access_token": response.session.access_token,
-                    "refresh_token": response.session.refresh_token if hasattr(response.session, 'refresh_token') else None
+                    "access_token": access_token,
+                    "refresh_token": data.get("refresh_token"),
                 }
             else:
-                result["message"] = "Please check your email to confirm your account before signing in."
+                result["message"] = (
+                    "Please check your email to confirm your account before signing in."
+                )
 
             return result
-        else:
-            return {
-                "success": False,
-                "error": "Sign up failed"
-            }
 
+        # Error response
+        error_msg = data.get("error_description") or data.get("msg") or data.get("error", "Sign up failed")
+        return {"success": False, "error": error_msg}
+
+    except httpx.TimeoutException as e:
+        logger.error(f"Sign up timeout: {e}")
+        return {"success": False, "error": f"Connection to auth service timed out: {e}"}
     except Exception as e:
         logger.error(f"Sign up error: {e}")
-        return {
-            "success": False,
-            "error": str(e)
-        }
+        return {"success": False, "error": str(e)}
 
 
 def sign_in(email: str, password: str) -> Dict[str, Any]:
     """
     Sign in a user with email and password.
+    Uses direct HTTP call to Supabase Auth REST API.
 
     Args:
         email: User's email address
@@ -164,37 +196,38 @@ def sign_in(email: str, password: str) -> Dict[str, Any]:
         Dict with 'success' boolean and 'user'/'session' or 'error' info
     """
     try:
-        client = get_supabase_client()
+        response = httpx.post(
+            f"{SUPABASE_URL}/auth/v1/token?grant_type=password",
+            headers=_get_auth_headers(),
+            json={"email": email, "password": password},
+            timeout=AUTH_TIMEOUT,
+        )
 
-        response = client.auth.sign_in_with_password({
-            "email": email,
-            "password": password
-        })
+        data = response.json()
 
-        if response.user and response.session:
+        if response.status_code == 200 and data.get("access_token"):
+            user = data.get("user", {})
             return {
                 "success": True,
                 "user": {
-                    "id": response.user.id,
-                    "email": response.user.email
+                    "id": user.get("id"),
+                    "email": user.get("email", email),
                 },
                 "session": {
-                    "access_token": response.session.access_token,
-                    "refresh_token": response.session.refresh_token
-                }
-            }
-        else:
-            return {
-                "success": False,
-                "error": "Invalid email or password"
+                    "access_token": data["access_token"],
+                    "refresh_token": data.get("refresh_token"),
+                },
             }
 
+        error_msg = data.get("error_description") or data.get("msg") or data.get("error", "Invalid email or password")
+        return {"success": False, "error": error_msg}
+
+    except httpx.TimeoutException as e:
+        logger.error(f"Sign in timeout: {e}")
+        return {"success": False, "error": f"Connection to auth service timed out: {e}"}
     except Exception as e:
         logger.error(f"Sign in error: {e}")
-        return {
-            "success": False,
-            "error": "Invalid email or password"
-        }
+        return {"success": False, "error": "Invalid email or password"}
 
 
 def sign_out(access_token: str) -> Dict[str, Any]:
@@ -208,14 +241,16 @@ def sign_out(access_token: str) -> Dict[str, Any]:
         Dict with 'success' boolean
     """
     try:
-        client = get_supabase_client()
-        client.auth.sign_out()
-
+        httpx.post(
+            f"{SUPABASE_URL}/auth/v1/logout",
+            headers={
+                **_get_auth_headers(),
+                "Authorization": f"Bearer {access_token}",
+            },
+            timeout=AUTH_TIMEOUT,
+        )
         return {"success": True}
 
     except Exception as e:
         logger.error(f"Sign out error: {e}")
-        return {
-            "success": False,
-            "error": str(e)
-        }
+        return {"success": False, "error": str(e)}
