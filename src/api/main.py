@@ -27,7 +27,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Version
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 
 # Global database engine for health checks (reused to avoid connection exhaustion)
 _health_check_engine = None
