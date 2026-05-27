@@ -6,12 +6,12 @@ A production-ready AI agent that transforms complex SEC Form 13F institutional h
 
 <div align="center">
 
-[![Live Demo](https://img.shields.io/badge/Live%20Demo-Streamlit-FF4B4B?style=for-the-badge&logo=streamlit)](https://form13faiagent-ia8jkydleycwabcjzeme4m.streamlit.app/)
+[![Live Demo](https://img.shields.io/badge/Live%20Demo-Railway-8b5cf6?style=for-the-badge&logo=railway)](https://streamlit-ui-production-2269.up.railway.app/)
 [![Python](https://img.shields.io/badge/Python-3.11+-3776AB?style=for-the-badge&logo=python)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-009688?style=for-the-badge&logo=fastapi)](https://fastapi.tiangolo.com/)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-316192?style=for-the-badge&logo=postgresql)](https://www.postgresql.org/)
 
-**[🚀 Try Live Demo](https://form13faiagent-ia8jkydleycwabcjzeme4m.streamlit.app/) • [📖 Documentation](docs/) • [🐛 Report Issue](https://github.com/egba4444/form13f_aiagent/issues)**
+**[🚀 Try Live Demo](https://streamlit-ui-production-2269.up.railway.app/) • [📖 Documentation](docs/) • [🐛 Report Issue](https://github.com/leokeechye/form13f_aiagent/issues)**
 
 </div>
 
@@ -37,7 +37,7 @@ Ask questions about institutional investor holdings in plain English and get ins
 - **🧠 RAG Semantic Search** - Search filing commentary and disclosures (10% of queries)
 - **📊 Interactive Visualizations** - Portfolio composition, ownership analysis, top movers
 - **🔒 Enterprise Security** - Multi-layer SQL validation, authentication, rate limiting
-- **🚀 Production Ready** - Deployed on Railway (API) + Streamlit Cloud (UI)
+- **🚀 Production Ready** - Deployed on Railway (API + Streamlit UI, two services)
 - **📱 Multi-Modal Access** - REST API, Python SDK, and web interface
 
 ## 🏗️ Architecture
@@ -86,7 +86,7 @@ Claude Formats Natural Language Answer
 | HTTP Client | httpx |
 | Testing | pytest |
 | Package Manager | uv (10x faster than pip) |
-| Deployment | Railway.app (API) + Streamlit Cloud (UI) |
+| Deployment | Railway.app — two services: API + Streamlit UI |
 | Containerization | Docker |
 
 ## 📋 Implementation Phases
@@ -158,7 +158,7 @@ docker-compose exec api python -m src.ingestion.ingest --folder /app/data/raw
 
 1. **Clone repository**
 ```bash
-git clone https://github.com/egba4444/form13f_aiagent.git
+git clone https://github.com/leokeechye/form13f_aiagent.git
 cd form13f_aiagent
 ```
 
@@ -211,7 +211,7 @@ git push
 2. **Connect to Railway**
 - Go to https://railway.app/new
 - Select "Deploy from GitHub repo"
-- Choose `egba4444/form13f_aiagent`
+- Choose `leokeechye/form13f_aiagent`
 
 3. **Add Environment Variables**
 ```bash
@@ -221,37 +221,24 @@ LLM_PROVIDER=anthropic
 LLM_MODEL=claude-3-5-sonnet-20241022
 ```
 
-**Done!** Your API will be live at `https://your-app.up.railway.app`
+**Done!** The API is live at **https://form13faiagent-production.up.railway.app** (`/docs` for the OpenAPI UI).
 
 See [docs/RAILWAY_DEPLOYMENT.md](docs/RAILWAY_DEPLOYMENT.md) for detailed guide.
 
-## ☁️ Streamlit Cloud Deployment
+## 🖥️ Streamlit UI Deployment
 
-Deploy the UI to Streamlit Cloud for free:
+The production UI runs as a **second Railway service** (`Dockerfile.streamlit`) pointed at the API:
 
-1. **Push to GitHub** (if not already done)
+1. **Add a new service** in the same Railway project from the same GitHub repo.
+2. **Set the Dockerfile** to `Dockerfile.streamlit` (Settings → Build).
+3. **Configure Environment Variables**:
 ```bash
-git push
+API_BASE_URL=https://form13faiagent-production.up.railway.app
 ```
 
-2. **Deploy to Streamlit Cloud**
-- Go to https://share.streamlit.io
-- Click "New app"
-- Select your repository: `egba4444/form13f_aiagent`
-- Set main file path: `src/ui/app.py`
-- Click "Deploy"
+**Production UI**: [https://streamlit-ui-production-2269.up.railway.app/](https://streamlit-ui-production-2269.up.railway.app/)
 
-3. **Configure Environment Variables**
-Add in Streamlit Cloud settings:
-```bash
-API_BASE_URL=https://your-app.up.railway.app
-```
-
-**Done!** Your UI will be live at a custom subdomain.
-
-**Production Example**: [https://form13faiagent-ia8jkydleycwabcjzeme4m.streamlit.app/](https://form13faiagent-ia8jkydleycwabcjzeme4m.streamlit.app/)
-
-**Note**: Streamlit Cloud uses `requirements.txt` for dependencies, which is included in the repository.
+> **Alternative (free):** the UI can also be hosted on [Streamlit Cloud](https://share.streamlit.io) — set the main file to `src/ui/app.py` and the same `API_BASE_URL`. Streamlit Cloud uses `requirements.txt`, which is included in the repo.
 
 ## 📁 Project Structure
 
@@ -501,7 +488,7 @@ For questions or feedback, please open an issue.
 
 **Status**: ✅ Phases 1-8 Complete - Production Ready
 **Architecture**: SQL-First + RAG Semantic Search
-**Live Demo**: [Streamlit App](https://form13faiagent-ia8jkydleycwabcjzeme4m.streamlit.app/)
+**Live Demo**: [Streamlit App](https://streamlit-ui-production-2269.up.railway.app/)
 
 ---
 

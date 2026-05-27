@@ -37,6 +37,25 @@ def _get_auth_headers() -> Dict[str, str]:
     }
 
 
+def _parse_auth_response(response: httpx.Response) -> Dict[str, Any]:
+    """
+    Parse a Supabase Auth response as JSON, tolerating non-JSON error pages.
+
+    The Supabase Auth gateway returns HTML (e.g. a Cloudflare 5xx page) when the
+    GoTrue service is unreachable. Calling response.json() on that body raises a
+    confusing "Expecting value: line 1 column 1 (char 0)" error, so handle it here
+    and surface the real HTTP status instead.
+    """
+    try:
+        return response.json()
+    except Exception:
+        raise RuntimeError(
+            f"Auth service unavailable (HTTP {response.status_code}). "
+            "The Supabase Auth service may be down or the project paused. "
+            "Please try again shortly."
+        )
+
+
 def get_supabase_client() -> Client:
     """
     Get or create Supabase client instance (singleton pattern).
@@ -143,7 +162,7 @@ def sign_up(email: str, password: str) -> Dict[str, Any]:
             timeout=AUTH_TIMEOUT,
         )
 
-        data = response.json()
+        data = _parse_auth_response(response)
 
         if response.status_code in (200, 201):
             user = data.get("user") or data
@@ -203,7 +222,7 @@ def sign_in(email: str, password: str) -> Dict[str, Any]:
             timeout=AUTH_TIMEOUT,
         )
 
-        data = response.json()
+        data = _parse_auth_response(response)
 
         if response.status_code == 200 and data.get("access_token"):
             user = data.get("user", {})
@@ -225,6 +244,10 @@ def sign_in(email: str, password: str) -> Dict[str, Any]:
     except httpx.TimeoutException as e:
         logger.error(f"Sign in timeout: {e}")
         return {"success": False, "error": f"Connection to auth service timed out: {e}"}
+    except RuntimeError as e:
+        # Auth service unavailable (non-JSON gateway error) — surface the real reason
+        logger.error(f"Sign in failed: {e}")
+        return {"success": False, "error": str(e)}
     except Exception as e:
         logger.error(f"Sign in error: {e}")
         return {"success": False, "error": "Invalid email or password"}
